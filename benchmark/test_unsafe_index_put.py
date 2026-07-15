@@ -64,12 +64,25 @@ def _gen_indices(input_shape, indices_shapes, accumulate):
     return indices
 
 
+def _is_float_dtype(dtype):
+    return dtype in (torch.float32, torch.float64, torch.float16, torch.bfloat16)
+
+
+def _make_tensor(shape, dtype, device):
+    if dtype == torch.bool:
+        return torch.randint(0, 2, shape, device=device).to(torch.bool)
+    elif _is_float_dtype(dtype):
+        return torch.randn(shape, dtype=dtype, device=device)
+    else:
+        return torch.randint(1, 10, shape, device=device).to(dtype)
+
+
 def unsafe_index_put_input_fn(shapes, dtype, device):
     """Input generator for _unsafe_index_put benchmark."""
     input_shape, indices_shapes, values_shape, accumulate = shapes
-    inp = torch.randn(input_shape, dtype=dtype, device=device)
+    inp = _make_tensor(input_shape, dtype, device)
     indices = _gen_indices(input_shape, indices_shapes, accumulate)
-    values = torch.randn(values_shape, dtype=dtype, device=device)
+    values = _make_tensor(values_shape, dtype, device)
     yield inp, indices, values, accumulate
 
 
@@ -116,15 +129,20 @@ class UnsafeIndexPutAccTrueBenchmark(UnsafeIndexPutBenchmark):
         return list(_SHAPES_ACC_TRUE)
 
 
+BENCH_FLOAT_DTYPES = [torch.float16, torch.float32, torch.float64, torch.bfloat16]
+BENCH_INT_DTYPES = [torch.int32, torch.int64]
+
+
 @pytest.mark.unsafe_index_put
 @pytest.mark.skipif(
     flag_gems.vendor_name == "tsingmicro", reason="Issue #4131: not working"
 )
-def test_unsafe_index_put_acc_false():
+def test_unsafe_index_put_acc_false_floats():
     bench = UnsafeIndexPutAccFalseBenchmark(
         op_name="_unsafe_index_put",
         torch_op=torch._unsafe_index_put,
-        dtypes=[torch.float16, torch.float32],
+        input_fn=unsafe_index_put_input_fn,
+        dtypes=BENCH_FLOAT_DTYPES,
     )
     bench.run()
 
@@ -133,10 +151,39 @@ def test_unsafe_index_put_acc_false():
 @pytest.mark.skipif(
     flag_gems.vendor_name == "tsingmicro", reason="Issue #4131: not working"
 )
-def test_unsafe_index_put_acc_true():
+def test_unsafe_index_put_acc_false_ints():
+    bench = UnsafeIndexPutAccFalseBenchmark(
+        op_name="_unsafe_index_put",
+        torch_op=torch._unsafe_index_put,
+        input_fn=unsafe_index_put_input_fn,
+        dtypes=BENCH_INT_DTYPES,
+    )
+    bench.run()
+
+
+@pytest.mark.unsafe_index_put
+@pytest.mark.skipif(
+    flag_gems.vendor_name == "tsingmicro", reason="Issue #4131: not working"
+)
+def test_unsafe_index_put_acc_true_floats():
     bench = UnsafeIndexPutAccTrueBenchmark(
         op_name="_unsafe_index_put",
         torch_op=torch._unsafe_index_put,
-        dtypes=[torch.float16, torch.float32],
+        input_fn=unsafe_index_put_input_fn,
+        dtypes=BENCH_FLOAT_DTYPES,
+    )
+    bench.run()
+
+
+@pytest.mark.unsafe_index_put
+@pytest.mark.skipif(
+    flag_gems.vendor_name == "tsingmicro", reason="Issue #4131: not working"
+)
+def test_unsafe_index_put_acc_true_ints():
+    bench = UnsafeIndexPutAccTrueBenchmark(
+        op_name="_unsafe_index_put",
+        torch_op=torch._unsafe_index_put,
+        input_fn=unsafe_index_put_input_fn,
+        dtypes=BENCH_INT_DTYPES,
     )
     bench.run()
