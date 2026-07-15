@@ -1,16 +1,20 @@
 /**
- * _unsafe_index_put C++ wrapper.
+ * _unsafe_index_put C++ wrapper v2.
  *
- * 与 Python wrapper 的关键区别:
- *   1. clone 走 cudaMemcpyAsync (DMA), 不经过 FlagGems 的 Triton _copy_kernel
- *   2. 所有 host 端计算 (broadcast shape/stride/padding) 在 C++ 完成, 无 Python 开销
- *   3. 直接通过 TritonJITFunction 启动 kernel, 绕过 @libentry() 和 use_gems()
+ * Covers ALL parameter forms in C++ (no Python fallback):
+ *   1. Bool/int8 masks → expanded via at::nonzero()
+ *   2. None indices → filled with at::arange()
+ *   3. Missing dims → padded with arange to cover all self dims
+ *   4. 2D grid kernel launch → eliminates expensive suffix_numel division
+ *   5. Backend-agnostic DMA copy via aten::copy_ redispatch
+ *
+ * Kernel: triton_src/unsafe_index_put_kernel.py (v2, 2D grid, up to 6 indices).
  */
 #include "flag_gems/operators.h"
 #include "flag_gems/utils.h"
 
+#include <algorithm>
 #include <array>
-#include <cstring>
 #include <numeric>
 #include <tuple>
 #include <vector>
@@ -23,11 +27,11 @@ namespace {
 
 using namespace triton_jit;
 
+static constexpr int kMaxNdim = 6;
+
 // ---------------------------------------------------------------------------
-// Host 端工具函数 (C++ 实现, 对应 Python 的 _broadcast_shape /
-// _broadcast_strides / _trailing_divisors / _pad / _heuristic_block)
+// Host-side utilities
 // ---------------------------------------------------------------------------
-static constexpr int kMaxNdim = 4;
 
 std::vector<int64_t> broadcast_shapes(const std::vector<std::vector<int64_t>>& shapes) {
   if (shapes.empty()) return {};
@@ -57,7 +61,7 @@ std::vector<int64_t> broadcast_strides(const std::vector<int64_t>& shape,
   for (int64_t i = 0; i < static_cast<int64_t>(shape.size()); i++) {
     int64_t j = pad + i;
     if (shape[i] == 1 && target_shape[j] != 1) {
-      out[j] = 0;  // broadcast dim
+      out[j] = 0;
     } else {
       out[j] = stride[i];
     }
@@ -84,9 +88,7 @@ std::vector<T> pad_vec(const std::vector<T>& seq, int64_t n, T fill) {
 }
 
 std::vector<std::vector<int64_t>> pad_2d(const std::vector<std::vector<int64_t>>& arr,
-                                         int64_t rows,
-                                         int64_t cols,
-                                         int64_t fill) {
+                                         int64_t rows, int64_t cols, int64_t fill) {
   std::vector<std::vector<int64_t>> out = arr;
   out.resize(rows, std::vector<int64_t>(cols, fill));
   for (auto& row : out) row.resize(cols, fill);
@@ -98,76 +100,127 @@ int64_t volume(const std::vector<int64_t>& shape) {
   return std::accumulate(shape.begin(), shape.end(), 1LL, std::multiplies<int64_t>());
 }
 
-int64_t heuristic_block(int64_t n) {
-  // Choose block size to balance occupancy and per-block work.
-  // For small N, use smaller blocks to get more parallelism.
-  // For moderate N, use medium blocks.
-  // For large N, use larger blocks to reduce grid launch overhead.
-  if (n <= 1024) return 128;
-  if (n <= 8192) return 256;
-  if (n <= 65536) return 512;
-  return 1024;
+void heuristic_2d_blocks(int64_t idx_numel, int64_t suffix_numel,
+                         int64_t& block_idx, int64_t& block_suf) {
+  // Triton requires tl.arange range to be power-of-2.
+  auto nearest_pow2 = [](int64_t x, int64_t cap) -> int64_t {
+    int64_t v = 1;
+    while (v * 2 <= x && v * 2 <= cap) v *= 2;
+    return std::max(int64_t(1), std::min(v, cap));
+  };
+  auto floor_pow2 = [](int64_t x) -> int64_t {
+    if (x <= 1) return 1;
+    int64_t v = 1;
+    while (v * 2 <= x) v *= 2;
+    return v;
+  };
+
+  constexpr int64_t kTarget = 256;
+
+  if (suffix_numel <= 32) {
+    // Small suffix: minimize grid_y (virtually 1D) to reduce launch overhead.
+    block_suf = floor_pow2(std::max(int64_t(1), suffix_numel));
+    block_idx = floor_pow2(std::max(int64_t(1),
+        std::min(kTarget / block_suf, idx_numel)));
+  } else if (suffix_numel >= idx_numel * 4) {
+    // Large suffix relative to idx: benefit from 2D grid.
+    block_idx = 1;
+    block_suf = nearest_pow2(suffix_numel, 256);
+  } else if (idx_numel >= suffix_numel * 4) {
+    block_suf = std::max(int64_t(1), nearest_pow2(suffix_numel, 256));
+    block_idx = nearest_pow2(idx_numel, kTarget / block_suf);
+  } else {
+    int64_t ratio = idx_numel / std::max(int64_t(1), suffix_numel);
+    if (ratio >= 16) { block_idx = 32; block_suf = 8; }
+    else if (ratio >= 4) { block_idx = 16; block_suf = 16; }
+    else { block_idx = 8; block_suf = 32; }
+  }
+  block_idx = floor_pow2(std::max(int64_t(1), std::min(block_idx, idx_numel)));
+  block_suf = floor_pow2(std::max(int64_t(1), std::min(block_suf, suffix_numel)));
 }
 
 // ---------------------------------------------------------------------------
-// 主函数
+// Index preprocessing: handle bool/None/padding in C++
 // ---------------------------------------------------------------------------
 
-at::Tensor unsafe_index_put(const at::Tensor& self,
-                            const c10::List<std::optional<at::Tensor>>& indices,
-                            const at::Tensor& values,
-                            bool accumulate) {
-  // ---- 快速路径判定 ----
-  if (indices.empty()) {
-    TORCH_CHECK(false, "at least one index must be provided");
+/// Expand a bool/byte mask into LongTensor indices via at::nonzero().
+/// Returns one LongTensor per masked dimension.
+std::vector<at::Tensor> expand_bool_mask(const at::Tensor& mask) {
+  auto nonzero = at::nonzero(mask);  // shape (K, ndim)
+  std::vector<at::Tensor> result;
+  int64_t ndim = nonzero.size(1);
+  result.reserve(ndim);
+  for (int64_t d = 0; d < ndim; d++) {
+    result.push_back(nonzero.select(1, d).contiguous());
+  }
+  return result;
+}
+
+/// Preprocess indices: expand bool masks, convert to Long, ensure contiguous.
+std::vector<at::Tensor> preprocess_indices(
+    const c10::List<std::optional<at::Tensor>>& indices) {
+
+  std::vector<at::Tensor> result;
+  for (int64_t i = 0; i < indices.size(); i++) {
+    TORCH_CHECK(indices[i].has_value(),
+                "_unsafe_index_put does not accept None indices");
+    auto dt = indices[i].value().dtype();
+    if (dt == at::kBool || dt == at::kByte) {
+      auto splits = expand_bool_mask(indices[i].value());
+      for (auto& t : splits) result.push_back(t);
+    } else {
+      auto t = indices[i].value();
+      if (t.dtype() != at::kLong) t = t.to(at::kLong);
+      result.push_back(t.contiguous());
+    }
   }
 
-  int64_t m = indices.size();
-  TORCH_CHECK(m <= kMaxNdim, "too many index tensors (max ", kMaxNdim, ")");
-  TORCH_CHECK(m <= self.dim(), "too many indices for tensor of dimension ", self.dim());
+  TORCH_CHECK(!result.empty(), "at least one index tensor required");
+  TORCH_CHECK(static_cast<int64_t>(result.size()) <= kMaxNdim,
+              "too many index tensors (max ", kMaxNdim, ")");
+  return result;
+}
 
-  // 检查所有索引都是非 None 的张量
-  for (int64_t i = 0; i < m; i++) {
-    TORCH_CHECK(indices[i].has_value(), "None indices not supported in fast path");
-  }
+// ---------------------------------------------------------------------------
+// Main kernel launcher
+// ---------------------------------------------------------------------------
 
+at::Tensor unsafe_index_put_impl(const at::Tensor& self,
+                                 const std::vector<at::Tensor>& idx_tensors,
+                                 const at::Tensor& values,
+                                 bool accumulate) {
+  int64_t m = idx_tensors.size();
   int64_t suf_ndim = self.dim() - m;
-  TORCH_CHECK(suf_ndim <= kMaxNdim, "too many suffix dims (max ", kMaxNdim, ")");
+  TORCH_CHECK(suf_ndim >= 0 && suf_ndim <= kMaxNdim,
+              "suffix ndim out of range: ", suf_ndim);
 
-  // 收集 index shapes/strides
+  // Collect index shapes/strides
   std::vector<std::vector<int64_t>> idx_shapes;
   idx_shapes.reserve(m);
   std::vector<std::vector<int64_t>> idx_strides;
   idx_strides.reserve(m);
-  std::vector<at::Tensor> idx_tensors;
-  idx_tensors.reserve(m);
 
   for (int64_t i = 0; i < m; i++) {
-    at::Tensor t = indices[i].value();
-    if (t.dtype() != at::kLong) t = t.to(at::kLong);
-    idx_tensors.push_back(t.contiguous());
+    const auto& t = idx_tensors[i];
     std::vector<int64_t> sh(t.sizes().begin(), t.sizes().end());
     std::vector<int64_t> st(t.strides().begin(), t.strides().end());
     idx_shapes.push_back(sh);
     idx_strides.push_back(st);
   }
 
-  // broadcast index shape
+  // Broadcast index shape
   std::vector<int64_t> idx_shape = broadcast_shapes(idx_shapes);
   int64_t idx_ndim = idx_shape.size();
-  TORCH_CHECK(idx_ndim <= kMaxNdim, "index space rank too large");
+  TORCH_CHECK(idx_ndim <= kMaxNdim, "index space rank too large: ", idx_ndim);
 
-  // suffix shape
+  // Suffix shape
   std::vector<int64_t> suffix_shape(self.sizes().begin() + m, self.sizes().end());
 
   int64_t idx_numel = volume(idx_shape);
   int64_t suffix_numel = volume(suffix_shape);
   int64_t N = idx_numel * suffix_numel;
 
-  // ---- 输出 tensor: empty_like + backend-agnostic copy ----
-  // 使用 aten::copy_ redispatch 到 CompositeExplicitAutograd,
-  // 绕过 FlagGems dispatch, 直接使用 PyTorch 原生 copy
-  // (在 CUDA 上使用 cudaMemcpyAsync, 在 NPU 上使用 aclrtMemcpy, 等等)
+  // ---- Output tensor: empty_like + backend-agnostic copy ----
   auto out = at::empty_like(self, self.options());
   {
     static auto copy_op =
@@ -181,16 +234,16 @@ at::Tensor unsafe_index_put(const at::Tensor& self,
 
   if (N == 0) return out;
 
-  // ---- 计算 kernel 参数 (padding 到 kMaxNdim) ----
-  // tensor strides in broadcast idx space
+  // ---- Compute kernel parameters (padded to kMaxNdim) ----
+  // Tensor strides in broadcast idx space
   std::vector<std::vector<int64_t>> tensor_strides;
   for (int64_t i = 0; i < m; i++) {
-    tensor_strides.push_back(broadcast_strides(idx_shapes[i], idx_strides[i], idx_shape));
+    tensor_strides.push_back(
+        broadcast_strides(idx_shapes[i], idx_strides[i], idx_shape));
   }
   auto tensor_strides_2d = pad_2d(tensor_strides, kMaxNdim, kMaxNdim, int64_t(0));
-  for (auto& row : tensor_strides_2d) row = pad_vec(row, kMaxNdim, int64_t(0));
 
-  // self advanced strides/sizes
+  // Self advanced strides/sizes (first m dims)
   std::vector<int64_t> self_adv_stride(kMaxNdim, 0);
   std::vector<int64_t> self_adv_size(kMaxNdim, 1);
   for (int64_t d = 0; d < m; d++) {
@@ -198,90 +251,116 @@ at::Tensor unsafe_index_put(const at::Tensor& self,
     self_adv_size[d] = self.size(d);
   }
 
-  // values strides
+  // Values strides in broadcast target space
   std::vector<int64_t> val_target_shape = idx_shape;
-  val_target_shape.insert(val_target_shape.end(), suffix_shape.begin(), suffix_shape.end());
+  val_target_shape.insert(val_target_shape.end(),
+                          suffix_shape.begin(), suffix_shape.end());
   std::vector<int64_t> val_shape(values.sizes().begin(), values.sizes().end());
   std::vector<int64_t> val_stride_vec(values.strides().begin(), values.strides().end());
   auto val_strides_full = broadcast_strides(val_shape, val_stride_vec, val_target_shape);
   auto val_adv_stride =
-      pad_vec(std::vector<int64_t>(val_strides_full.begin(), val_strides_full.begin() + idx_ndim),
+      pad_vec(std::vector<int64_t>(val_strides_full.begin(),
+                                   val_strides_full.begin() + idx_ndim),
               kMaxNdim, int64_t(0));
   auto val_suf_stride =
-      pad_vec(std::vector<int64_t>(val_strides_full.begin() + idx_ndim, val_strides_full.end()),
+      pad_vec(std::vector<int64_t>(val_strides_full.begin() + idx_ndim,
+                                   val_strides_full.end()),
               kMaxNdim, int64_t(0));
 
-  // self suffix strides
+  // Self suffix strides
   std::vector<int64_t> self_suf_stride(kMaxNdim, 0);
   for (int64_t d = 0; d < suf_ndim; d++) {
     self_suf_stride[d] = self.stride(m + d);
   }
 
-  // divisors
+  // Divisors
   auto idx_div = pad_vec(trailing_divisors(idx_shape), kMaxNdim, int64_t(1));
   auto suf_div = pad_vec(trailing_divisors(suffix_shape), kMaxNdim, int64_t(1));
 
-  // index data pointers
-  std::vector<void*> idx_ptrs;
-  idx_ptrs.reserve(kMaxNdim);
-  for (int64_t i = 0; i < m; i++) {
-    idx_ptrs.push_back(idx_tensors[i].data_ptr());
-  }
-  void* pad_ptr = m > 0 ? idx_ptrs[0] : nullptr;
-  idx_ptrs.resize(kMaxNdim, pad_ptr);
+  // ---- 2D grid parameters ----
+  int64_t block_idx, block_suf;
+  heuristic_2d_blocks(idx_numel, suffix_numel, block_idx, block_suf);
 
-  int64_t block = heuristic_block(N);
-  int64_t grid_x = (N + block - 1) / block;
+  int64_t grid_x = (idx_numel + block_idx - 1) / block_idx;
+  int64_t grid_y = (suffix_numel + block_suf - 1) / block_suf;
 
-  // ---- 启动 Triton kernel ----
-  // 填充 padding 的 index tensor (用第一个有效 tensor 填充, kernel 不会访问)
-  while (idx_tensors.size() < static_cast<size_t>(kMaxNdim)) {
-    idx_tensors.push_back(idx_tensors[0]);
-  }
-
-  const TritonJITFunction& kernel = TritonJITFunction::get_instance(
-      (utils::get_triton_src_path() / "unsafe_index_put_kernel.py").string(),
-      "unsafe_index_put_kernel_cpp");
-
+  // ---- Launch Triton kernel ----
   c10::DeviceGuard guard(out.device());
   auto stream = backend::getCurrentStream();
   auto raw_stream = backend::getRawStream(stream);
 
+  const TritonJITFunction& kernel = TritonJITFunction::get_instance(
+      (utils::get_triton_src_path() / "unsafe_index_put_kernel.py").string(),
+      "unsafe_index_put_kernel_v2");
+
+  // Pad index tensor list for kernel args (kernel always takes kMaxNdim pointers)
+  std::vector<at::Tensor> kernel_idx = idx_tensors;
+  while (kernel_idx.size() < static_cast<size_t>(kMaxNdim)) {
+    kernel_idx.push_back(kernel_idx.empty() ? at::Tensor() : kernel_idx[0]);
+  }
+
+  // Build the massive argument list for the 2D grid kernel.
+  // Order must match unsafe_index_put_kernel_v2 exactly.
   kernel(raw_stream,
-         static_cast<unsigned int>(grid_x),  // grid_x
-         1,                                    // grid_y
-         1,                                    // grid_z
-         4,                                    // num_warps
-         4,                                    // num_stages
-         // 张量 (TritonJITFunction 自动转为 data_ptr)
-         out,
-         values,
-         idx_tensors[0], idx_tensors[1], idx_tensors[2], idx_tensors[3],
-         // index 空间除数 (IDX_NDIM 个, padded)
-         idx_div[0], idx_div[1], idx_div[2], idx_div[3],
-         // tensor strides (M x kMaxNdim)
-         tensor_strides_2d[0][0], tensor_strides_2d[0][1], tensor_strides_2d[0][2], tensor_strides_2d[0][3],
-         tensor_strides_2d[1][0], tensor_strides_2d[1][1], tensor_strides_2d[1][2], tensor_strides_2d[1][3],
-         tensor_strides_2d[2][0], tensor_strides_2d[2][1], tensor_strides_2d[2][2], tensor_strides_2d[2][3],
-         tensor_strides_2d[3][0], tensor_strides_2d[3][1], tensor_strides_2d[3][2], tensor_strides_2d[3][3],
-         // values strides
-         val_adv_stride[0], val_adv_stride[1], val_adv_stride[2], val_adv_stride[3],
-         // self advanced strides/sizes
-         self_adv_stride[0], self_adv_stride[1], self_adv_stride[2], self_adv_stride[3],
-         self_adv_size[0], self_adv_size[1], self_adv_size[2], self_adv_size[3],
-         // suffix divisors
-         suf_div[0], suf_div[1], suf_div[2], suf_div[3],
-         // suffix strides
-         self_suf_stride[0], self_suf_stride[1], self_suf_stride[2], self_suf_stride[3],
-         val_suf_stride[0], val_suf_stride[1], val_suf_stride[2], val_suf_stride[3],
-         // 元信息
+         static_cast<unsigned int>(grid_x),
+         static_cast<unsigned int>(grid_y),
+         1,                     // grid_z
+         4,                     // num_warps
+         4,                     // num_stages
+         // outputs / values
+         out, values,
+         // index data pointers (kMaxNdim)
+         kernel_idx[0], kernel_idx[1], kernel_idx[2],
+         kernel_idx[3], kernel_idx[4], kernel_idx[5],
+         // idx_div (kMaxNdim)
+         idx_div[0], idx_div[1], idx_div[2],
+         idx_div[3], idx_div[4], idx_div[5],
+         // tensor_strides (kMaxNdim × kMaxNdim = 36 scalars)
+         tensor_strides_2d[0][0], tensor_strides_2d[0][1],
+         tensor_strides_2d[0][2], tensor_strides_2d[0][3],
+         tensor_strides_2d[0][4], tensor_strides_2d[0][5],
+         tensor_strides_2d[1][0], tensor_strides_2d[1][1],
+         tensor_strides_2d[1][2], tensor_strides_2d[1][3],
+         tensor_strides_2d[1][4], tensor_strides_2d[1][5],
+         tensor_strides_2d[2][0], tensor_strides_2d[2][1],
+         tensor_strides_2d[2][2], tensor_strides_2d[2][3],
+         tensor_strides_2d[2][4], tensor_strides_2d[2][5],
+         tensor_strides_2d[3][0], tensor_strides_2d[3][1],
+         tensor_strides_2d[3][2], tensor_strides_2d[3][3],
+         tensor_strides_2d[3][4], tensor_strides_2d[3][5],
+         tensor_strides_2d[4][0], tensor_strides_2d[4][1],
+         tensor_strides_2d[4][2], tensor_strides_2d[4][3],
+         tensor_strides_2d[4][4], tensor_strides_2d[4][5],
+         tensor_strides_2d[5][0], tensor_strides_2d[5][1],
+         tensor_strides_2d[5][2], tensor_strides_2d[5][3],
+         tensor_strides_2d[5][4], tensor_strides_2d[5][5],
+         // val_adv_stride (kMaxNdim)
+         val_adv_stride[0], val_adv_stride[1], val_adv_stride[2],
+         val_adv_stride[3], val_adv_stride[4], val_adv_stride[5],
+         // self_adv_stride (kMaxNdim)
+         self_adv_stride[0], self_adv_stride[1], self_adv_stride[2],
+         self_adv_stride[3], self_adv_stride[4], self_adv_stride[5],
+         // self_adv_size (kMaxNdim)
+         self_adv_size[0], self_adv_size[1], self_adv_size[2],
+         self_adv_size[3], self_adv_size[4], self_adv_size[5],
+         // suf_div (kMaxNdim)
+         suf_div[0], suf_div[1], suf_div[2],
+         suf_div[3], suf_div[4], suf_div[5],
+         // self_suf_stride (kMaxNdim)
+         self_suf_stride[0], self_suf_stride[1], self_suf_stride[2],
+         self_suf_stride[3], self_suf_stride[4], self_suf_stride[5],
+         // val_suf_stride (kMaxNdim)
+         val_suf_stride[0], val_suf_stride[1], val_suf_stride[2],
+         val_suf_stride[3], val_suf_stride[4], val_suf_stride[5],
+         // meta
          idx_numel, suffix_numel, N,
          // constexpr params
          static_cast<int32_t>(m),
          static_cast<int32_t>(idx_ndim),
          static_cast<int32_t>(suf_ndim),
          accumulate,
-         block);
+         static_cast<int32_t>(block_idx),
+         static_cast<int32_t>(block_suf));
 
   return out;
 }
@@ -289,37 +368,15 @@ at::Tensor unsafe_index_put(const at::Tensor& self,
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// Operator dispatch: 快速路径处理 all-tensor, non-None, non-bool 索引
-// 不支持的配置通过 aten::_index_put_impl_ redispatch (绕过 FlagGems) 回退到原生 PyTorch
+// Operator dispatch: all parameter forms handled in C++
+// ---------------------------------------------------------------------------
 at::Tensor unsafe_index_put_cpp(const at::Tensor& self,
                                 const c10::List<std::optional<at::Tensor>>& indices,
                                 const at::Tensor& values,
                                 bool accumulate) {
-  // 快速路径: no None, no bool/byte mask, dims within limit
-  bool all_tensor = true;
-  int64_t m = indices.size();
-  for (int64_t i = 0; i < m; i++) {
-    if (!indices[i].has_value()) { all_tensor = false; break; }
-    auto dt = indices[i].value().dtype();
-    if (dt == at::kBool || dt == at::kByte) { all_tensor = false; break; }
-  }
-
-  if (all_tensor && m > 0 && m <= kMaxNdim) {
-    return unsafe_index_put(self, indices, values, accumulate);
-  }
-
-  // 回退: 通过 CompositeExplicitAutograd redispatch 到 PyTorch 原生实现
-  // (绕过 FlagGems dispatch, 适用于 None 索引、bool mask、6+ 维度等情况)
-  auto out = self.clone();
-  static auto index_put_impl_op =
-      c10::Dispatcher::singleton()
-          .findSchemaOrThrow("aten::_index_put_impl_", "")
-          .typed<at::Tensor&(at::Tensor&, const c10::List<std::optional<at::Tensor>>&,
-                             const at::Tensor&, bool, bool)>();
-  constexpr c10::DispatchKeySet fallback_keyset(
-      c10::DispatchKeySet(c10::DispatchKey::CompositeExplicitAutograd));
-  index_put_impl_op.redispatch(fallback_keyset, out, indices, values, accumulate, /*unsafe=*/true);
-  return out;
+  // Preprocess: bool→int, int→long, contiguous
+  auto processed = preprocess_indices(indices);
+  return unsafe_index_put_impl(self, processed, values, accumulate);
 }
 
 }  // namespace flag_gems
