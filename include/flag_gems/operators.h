@@ -257,4 +257,9 @@ at::Tensor to_copy(const at::Tensor &self,
 
 at::Tensor &copy_(at::Tensor &dst, const at::Tensor &src, bool non_blocking = false);
 
+at::Tensor unsafe_index_put_cpp(const at::Tensor &self,
+                                const c10::List<std::optional<at::Tensor>> &indices,
+                                const at::Tensor &values,
+                                bool accumulate);
+
 }  // namespace flag_gems

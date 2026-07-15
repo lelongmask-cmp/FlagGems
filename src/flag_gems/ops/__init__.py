@@ -21,6 +21,7 @@ from flag_gems.ops._sparse_semi_structured_mm import _sparse_semi_structured_mm
 from flag_gems.ops._thnn_fused_lstm_cell_backward_impl import (
     _thnn_fused_lstm_cell_backward_impl,
 )
+from flag_gems.ops._unsafe_index_put import _unsafe_index_put
 from flag_gems.ops._unsafe_masked_index import _unsafe_masked_index
 from flag_gems.ops._unsafe_masked_index_put_accumulate import (
     _unsafe_masked_index_put_accumulate,
@@ -539,6 +540,7 @@ __all__ = [
     "_sparse_semi_structured_mm",
     "_thnn_fused_lstm_cell_backward_impl",
     "_unique2",
+    "_unsafe_index_put",
     "_unsafe_masked_index",
     "_unsafe_masked_index_put_accumulate",
     "_upsample_bicubic2d_aa",

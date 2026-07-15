@@ -123,6 +123,22 @@ PYBIND11_MODULE(c_operators, m) {
   m.def("flash_attn_varlen_func", &flag_gems::flash_attn_varlen_func);
   m.def("rwkv_mm_sparsity", &flag_gems::rwkv_mm_sparsity);
   m.def("rwkv_ka_fusion", &flag_gems::rwkv_ka_fusion);
+  m.def(
+      "unsafe_index_put",
+      [](const at::Tensor &self,
+         const std::vector<std::optional<at::Tensor>> &indices,
+         const at::Tensor &values,
+         bool accumulate) {
+        c10::List<std::optional<at::Tensor>> indices_list;
+        for (auto &idx : indices) {
+          indices_list.push_back(idx);
+        }
+        return flag_gems::unsafe_index_put_cpp(self, indices_list, values, accumulate);
+      },
+      py::arg("self"),
+      py::arg("indices"),
+      py::arg("values"),
+      py::arg("accumulate"));
   m.def("copy_", &flag_gems::copy_);
   m.def("to_copy", &flag_gems::to_copy);
   m.def("fp8_matmul",
