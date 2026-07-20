@@ -40,6 +40,7 @@ def unsafe_index_put_kernel_v2(
     IDX_NDIM: tl.constexpr,
     SUF_NDIM: tl.constexpr,
     ACCUMULATE: tl.constexpr,
+    USE_CAS: tl.constexpr,
     BLOCK_IDX: tl.constexpr,
     BLOCK_SUF: tl.constexpr,
 ):
@@ -220,6 +221,37 @@ def unsafe_index_put_kernel_v2(
     # ---- load and store/accumulate ----
     v = tl.load(values_ptr + val_off, mask=mask, other=0.0)
     if ACCUMULATE:
-        tl.atomic_add(out_ptr + self_off, v, mask=mask)
+        if USE_CAS:
+            # CAS-based atomic add — universal dtype support.
+            # tl.atomic_add has limited dtype support (no int8/uint8/int16,
+            # and float16/bfloat16 produce wrong results on some hardware).
+            #
+            # tl.atomic_cas does not support a mask parameter, so the loop
+            # runs for all elements in the block. Safe by design:
+            #  - Tail elements (mask=False): redirected to element 0,
+            #    CAS with cmp=val=0 → no-op (no modification).
+            #  - Successful lanes: `succeeded` flag keeps `old` unchanged,
+            #    subsequent CAS attempts fail harmlessly (cmp != *ptr).
+            old = tl.load(out_ptr + self_off, mask=mask, other=0)
+            safe_off = tl.where(mask, self_off, tl.zeros_like(self_off))
+            # Bitcast the output pointer to uint16 so that tl.atomic_cas
+            # performs an exact integer comparison (matching CUDA's native
+            # atomicAdd implementation for fp16/bf16).  Otherwise float
+            # comparison quirks (-0.0 vs +0.0) cause lost accumulations.
+            uint_ptr = out_ptr.to(tl.pointer_type(tl.uint16))
+            for _ in range(10):
+                # Match CUDA atomicAdd semantics: float32 accumulation
+                # rounded to native dtype for the atomic compare-and-swap.
+                new_val = (old.to(tl.float32) + v.to(tl.float32)).to(old.dtype)
+                old_bits = old.to(tl.uint16, bitcast=True)
+                new_bits = new_val.to(tl.uint16, bitcast=True)
+                actual_bits = tl.atomic_cas(uint_ptr + safe_off, old_bits, new_bits)
+                actual = actual_bits.to(old.dtype, bitcast=True)
+                # For lanes where CAS succeeded, zero out v so subsequent
+                # iterations are no-ops.  Integer comparison is exact bitwise.
+                v = tl.where(actual_bits == old_bits, tl.zeros_like(v), v)
+                old = actual
+        else:
+            tl.atomic_add(out_ptr + self_off, v, mask=mask)
     else:
         tl.store(out_ptr + self_off, v, mask=mask)

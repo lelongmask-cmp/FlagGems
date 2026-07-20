@@ -284,6 +284,19 @@ at::Tensor unsafe_index_put_impl(const at::Tensor& self,
   int64_t grid_x = (idx_numel + block_idx - 1) / block_idx;
   int64_t grid_y = (suffix_numel + block_suf - 1) / block_suf;
 
+  // ---- Determine whether to use CAS-based atomic add ----
+  // tl.atomic_add has limited dtype support:
+  //   - Compilation error: int8, uint8, int16
+  //   - Wrong results: float16, bfloat16
+  bool use_cas = false;
+  if (accumulate) {
+    auto dtype = self.scalar_type();
+    if (dtype == at::kHalf || dtype == at::kBFloat16 ||
+        dtype == at::kByte || dtype == at::kChar || dtype == at::kShort) {
+      use_cas = true;
+    }
+  }
+
   // ---- Launch Triton kernel ----
   c10::DeviceGuard guard(out.device());
   auto stream = backend::getCurrentStream();
@@ -359,6 +372,7 @@ at::Tensor unsafe_index_put_impl(const at::Tensor& self,
          static_cast<int32_t>(idx_ndim),
          static_cast<int32_t>(suf_ndim),
          accumulate,
+         use_cas,
          static_cast<int32_t>(block_idx),
          static_cast<int32_t>(block_suf));
 
@@ -374,6 +388,29 @@ at::Tensor unsafe_index_put_cpp(const at::Tensor& self,
                                 const c10::List<std::optional<at::Tensor>>& indices,
                                 const at::Tensor& values,
                                 bool accumulate) {
+  // Accumulate workaround for types where Triton atomic_add has issues:
+  //  - int8/uint8: atomic_add/atomic_cas not supported → cast to int32
+  //  - float16/bfloat16: atomic_add produces incorrect results (Triton CAS
+  //    loop does not match CUDA atomicAdd exactly) → cast to float32
+  // After the accumulate on the wider type, cast back.
+  if (accumulate) {
+    auto dtype = self.scalar_type();
+    if (dtype == at::kByte || dtype == at::kChar) {
+      auto self32 = self.to(at::kInt);
+      auto values32 = values.to(at::kInt);
+      auto processed = preprocess_indices(indices);
+      auto out32 = unsafe_index_put_impl(self32, processed, values32, accumulate);
+      return out32.to(dtype);
+    }
+    if (dtype == at::kHalf || dtype == at::kBFloat16) {
+      auto self32 = self.to(at::kFloat);
+      auto values32 = values.to(at::kFloat);
+      auto processed = preprocess_indices(indices);
+      auto out32 = unsafe_index_put_impl(self32, processed, values32, accumulate);
+      return out32.to(dtype);
+    }
+  }
+
   // Preprocess: bool→int, int→long, contiguous
   auto processed = preprocess_indices(indices);
   return unsafe_index_put_impl(self, processed, values, accumulate);
