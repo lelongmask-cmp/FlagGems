@@ -288,15 +288,6 @@ at::Tensor unsafe_index_put_impl(const at::Tensor& self,
   // tl.atomic_add has limited dtype support:
   //   - Compilation error: int8, uint8, int16
   //   - Wrong results: float16, bfloat16
-  bool use_cas = false;
-  if (accumulate) {
-    auto dtype = self.scalar_type();
-    if (dtype == at::kHalf || dtype == at::kBFloat16 ||
-        dtype == at::kByte || dtype == at::kChar || dtype == at::kShort) {
-      use_cas = true;
-    }
-  }
-
   // ---- Launch Triton kernel ----
   c10::DeviceGuard guard(out.device());
   auto stream = backend::getCurrentStream();
@@ -372,7 +363,6 @@ at::Tensor unsafe_index_put_impl(const at::Tensor& self,
          static_cast<int32_t>(idx_ndim),
          static_cast<int32_t>(suf_ndim),
          accumulate,
-         use_cas,
          static_cast<int32_t>(block_idx),
          static_cast<int32_t>(block_suf));
 
@@ -395,7 +385,7 @@ at::Tensor unsafe_index_put_cpp(const at::Tensor& self,
   // After the accumulate on the wider type, cast back.
   if (accumulate) {
     auto dtype = self.scalar_type();
-    if (dtype == at::kByte || dtype == at::kChar) {
+    if (dtype == at::kByte || dtype == at::kChar || dtype == at::kShort) {
       auto self32 = self.to(at::kInt);
       auto values32 = values.to(at::kInt);
       auto processed = preprocess_indices(indices);
