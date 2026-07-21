@@ -38,7 +38,9 @@ def _unsafe_index_put(inp, indices, values, accumulate=False):
         cpu_indices = [idx.cpu() for idx in indices]
         cpu_out = out.cpu()
         cpu_values = values.cpu()
-        torch._index_put_impl_(cpu_out, cpu_indices, cpu_values, accumulate, unsafe=True)
+        torch._index_put_impl_(
+            cpu_out, cpu_indices, cpu_values, accumulate, unsafe=True
+        )
         out = cpu_out.to(inp_device)
     else:
         torch._index_put_impl_(out, indices, values, accumulate, unsafe=True)

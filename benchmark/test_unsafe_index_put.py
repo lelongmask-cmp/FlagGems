@@ -4,7 +4,7 @@ import torch
 
 import flag_gems
 
-from . import base, consts
+from . import base
 
 # Comprehensive shapes covering all usage patterns
 # Format: (input_shape, [index_shapes], values_shape, accumulate)
@@ -17,7 +17,7 @@ _SHAPES_ACC_FALSE = (
     ((32, 32), ((2, 8),), (32,), False),
     # Replace=False: index elements must be ≤ input dim size
     # so max index elements = input_shape[i]
-    ((256, 256), ((16, 16),), (256,), False),   # 256 ≤ 256
+    ((256, 256), ((16, 16),), (256,), False),  # 256 ≤ 256
     ((1024, 1024), ((64,),), (1024,), False),
     ((1024, 1024), ((4, 64),), (1024,), False),
     ((4096, 4096), ((256,),), (4096,), False),
@@ -110,9 +110,8 @@ class UnsafeIndexPutBenchmark(base.Benchmark):
     def set_shapes(self, shape_file_path=None):
         """Override to use only our shapes, not DEFAULT_SHAPES."""
         # Skip the default shape loading; call set_more_shapes directly
-        if (
-            hasattr(self, "set_more_shapes")
-            and callable(getattr(self, "set_more_shapes"))
+        if hasattr(self, "set_more_shapes") and callable(
+            getattr(self, "set_more_shapes")
         ):
             self.shapes = list(self.set_more_shapes() or [])
         if not self.shapes:

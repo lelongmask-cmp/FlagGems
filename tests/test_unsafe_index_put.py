@@ -122,8 +122,9 @@ def test_unsafe_index_put_bool_mask_dtypes(inp_dtype):
     UNSAFE_INDEX_PUT_SHAPES,
 )
 @pytest.mark.parametrize("dtype", FLOAT_DTYPES)
-def test_unsafe_index_put_shapes(input_shape, indices_shapes, values_shape,
-                                  accumulate, dtype):
+def test_unsafe_index_put_shapes(
+    input_shape, indices_shapes, values_shape, accumulate, dtype
+):
     inp = torch.randn(input_shape, dtype=dtype, device=flag_gems.device)
     indices = gen_indices(input_shape, indices_shapes, accumulate, flag_gems.device)
     values = torch.randn(values_shape, dtype=dtype, device=flag_gems.device)
@@ -146,8 +147,9 @@ def test_unsafe_index_put_shapes(input_shape, indices_shapes, values_shape,
     UNSAFE_INDEX_PUT_SHAPES[:5],
 )
 @pytest.mark.parametrize("dtype", INT_DTYPES)
-def test_unsafe_index_put_int_shapes(input_shape, indices_shapes, values_shape,
-                                      accumulate, dtype):
+def test_unsafe_index_put_int_shapes(
+    input_shape, indices_shapes, values_shape, accumulate, dtype
+):
     inp = torch.randint(1, 10, input_shape, device=flag_gems.device).to(dtype)
     indices = gen_indices(input_shape, indices_shapes, accumulate, flag_gems.device)
     values = torch.randint(1, 10, values_shape, device=flag_gems.device).to(dtype)
