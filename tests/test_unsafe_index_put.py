@@ -59,6 +59,25 @@ def gen_indices(input_shape, indices_shapes, accumulate, device, dtype=torch.int
     return indices
 
 
+def assert_accumulate_close(res, ref, dtype):
+    """Assert helper for accumulate=True float tests.
+
+    With duplicate indices the summation order is implementation-defined:
+    PyTorch's CUDA kernel accumulates serially after a radix sort, while
+    FlagGems accumulates via fp32 atomic_add in arbitrary GPU scheduling
+    order. Both accumulate in fp32 and round to fp16/bf16 once, but fp32
+    reassociation noise can flip the final rounding by 1 ulp of the output
+    dtype. This is not an implementation defect — even PyTorch's own CPU vs
+    CUDA results bit-differ on essentially every run for this case — so the
+    tolerance must cover >=2 ulp. bf16's default rtol (0.016) already does;
+    fp16's (0.001) does not.
+    """
+    if dtype == torch.float16:
+        torch.testing.assert_close(res, ref, atol=1e-3, rtol=4e-3)
+    else:
+        utils.gems_assert_close(res, ref, dtype)
+
+
 # ---- Core dtype × index_dtype tests ----
 @pytest.mark.unsafe_index_put
 @pytest.mark.parametrize("inp_dtype", ALL_INPUT_DTYPES)
@@ -137,7 +156,10 @@ def test_unsafe_index_put_shapes(
     with flag_gems.use_gems():
         res_out = torch._unsafe_index_put(inp, indices, values, accumulate)
 
-    utils.gems_assert_close(res_out, ref_out, dtype)
+    if accumulate:
+        assert_accumulate_close(res_out, ref_out, dtype)
+    else:
+        utils.gems_assert_close(res_out, ref_out, dtype)
 
 
 # ---- Integer shape tests ----
@@ -230,7 +252,7 @@ def test_unsafe_index_put_accumulate(dtype):
     with flag_gems.use_gems():
         res_out = torch._unsafe_index_put(inp, indices, values, True)
 
-    utils.gems_assert_close(res_out, ref_out, dtype)
+    assert_accumulate_close(res_out, ref_out, dtype)
 
 
 @pytest.mark.unsafe_index_put
