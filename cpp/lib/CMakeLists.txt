@@ -41,6 +41,7 @@ add_library(operators
             rwkv_mm_sparsity.cpp
             rwkv_ka_fusion.cpp
             copy.cpp
+            unsafe_index_put.cpp
             accuracy_utils.cpp
             fp8_matmul.cpp
             fp8_matmul_direct.cpp)
