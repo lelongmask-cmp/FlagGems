@@ -16,7 +16,6 @@ import logging
 
 import torch
 
-from flag_gems.ops.cat import cat
 from flag_gems.ops.masked_select import masked_select
 
 logger = logging.getLogger(__name__)
@@ -72,9 +71,13 @@ def masked_scatter_backward(grad_output, mask, sizes):
         # by `source` during the forward pass; any remaining tail of `source`
         # (when source.numel() > mask.sum()) never contributed to the output,
         # so its gradient is exactly zero.
-        zeros_fillin = torch.zeros(
-            diff_nelem, dtype=mask_selected.dtype, device=mask_selected.device
+        # Pre-allocate the full output and copy the selected elements to the
+        # front via a single slice assignment — avoids a separate cat kernel
+        # launch compared to the torch.cat / flag_gems.cat path.
+        out = torch.zeros(
+            numel, dtype=mask_selected.dtype, device=mask_selected.device
         )
-        mask_selected = cat([mask_selected, zeros_fillin], dim=0)
+        out[: mask_selected.numel()] = mask_selected
+        mask_selected = out
 
     return mask_selected.view(sizes)
