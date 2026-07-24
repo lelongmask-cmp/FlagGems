@@ -23,12 +23,42 @@ import flag_gems
 from . import accuracy_utils as utils
 from . import conftest as cfg
 
+# ---------------------------------------------------------------------------
+# Custom shapes spanning the masked_select kernel's two code paths:
+#   - N <= 4096  ->  single-pass (1 block, tl.cumsum)
+#   - N >  4096  ->  multi-CTA  (mask_part_sum + write_back)
+#
+# Shapes are chosen to cover small / boundary / medium / large at even
+# intervals so regressions in any regime are caught early.
+# ---------------------------------------------------------------------------
+CUSTOM_SHAPES = [
+    # ---- small: single-pass, BLOCK_SIZE <= 1024 ----
+    (16,),  # N = 16
+    (128,),  # N = 128
+    (512,),  # N = 512
+    # ---- boundary: single-pass, BLOCK_SIZE 1024..4096 ----
+    (1024,),  # N = 1024
+    (2048,),  # N = 2048
+    (4096,),  # N = 4096  (max single-pass)
+    # ---- above boundary: multi-CTA ----
+    (4097,),  # N = 4097  (just above, 1-block degenerate)
+    (8192,),  # N = 8192
+    (64, 128),  # N = 8192  (2-D variant)
+    # ---- large: multi-CTA, multiple blocks ----
+    (128, 256),  # N = 32768
+    (256, 1024),  # N = 262144
+    (1024, 1024),  # N = 1048576
+]
+
 if cfg.QUICK_MODE:
     FLOAT_DTYPES = [torch.float32]
-    THRESHOLD_SHAPE = [(0.3, utils.REDUCTION_SHAPES[0])]
+    # One shape from each code path
+    THRESHOLD_SHAPE = [(0.5, (16,)), (0.5, (4097,))]
 else:
     FLOAT_DTYPES = utils.FLOAT_DTYPES
-    THRESHOLD_SHAPE = list(zip([0.3, 0.5, 0.7], utils.REDUCTION_SHAPES))
+    THRESHOLD_SHAPE = list(
+        zip([0.3, 0.5, 0.7] * (len(CUSTOM_SHAPES) // 3 + 1), CUSTOM_SHAPES)
+    )
 
 # Make sure every thread has same seed.
 random.seed(time.time() // 100)
