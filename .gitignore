@@ -40,3 +40,4 @@ tests/*.json
 
 # Generated benchmark data (lives in gh-pages only)
 docs/benchmark/
+kernel_meta/

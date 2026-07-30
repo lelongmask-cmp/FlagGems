@@ -174,16 +174,20 @@ def _multi_tile_path(grad_output, mask, numel, N):
         mask_flat = mask.ravel()
         n_tiles = triton.cdiv(N, _TILE_SIZE)
 
+        # 1. tile cumsum (reads bool directly, no int32 copy)
         prefix_sum = torch.empty(N, dtype=torch.int32, device=device)
         tile_totals = torch.empty(n_tiles, dtype=torch.int64, device=device)
         _tile_cumsum_kernel[(n_tiles,)](
             mask_flat, prefix_sum, tile_totals, N, TILE_SIZE=_TILE_SIZE,
         )
+
+        # 2. scan + tile_update → full 1-based prefix sum
         tile_offsets = _exclusive_scan(tile_totals, n_tiles, device)
         _tile_update_kernel[(n_tiles,)](
             prefix_sum, tile_offsets, N, TILE_SIZE=_TILE_SIZE,
         )
 
+        # 3. autotuned scatter (uses full prefix sum, no per-CTA tile lookup)
         n_selected = prefix_sum[-1].item()
         mask_selected = torch.empty(n_selected, dtype=grad_output.dtype, device=device)
         from .masked_select import masked_select_kernel
