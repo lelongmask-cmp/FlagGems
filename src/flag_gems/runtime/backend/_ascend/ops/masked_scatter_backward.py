@@ -77,6 +77,20 @@ def _fused_kernel(
              mask=block_mask & mask_val.to(tl.int1) & (pos >= 0) & (pos < out_numel))
 
 
+@libentry()
+@triton.jit(do_not_specialize=["numel"])
+def _pad_kernel(
+    selected_ptr, out_ptr, n_selected, numel, BLOCK_SIZE: tl.constexpr,
+):
+    """Fused zero-pad + copy: out[0:n_selected] = selected, rest = 0."""
+    pid = ext.program_id(axis=0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    m = offsets < numel
+    in_range = offsets < n_selected
+    val = tl.load(selected_ptr + offsets, mask=(m & in_range), other=0)
+    tl.store(out_ptr + offsets, val, mask=m)
+
+
 # ---------------------------------------------------------------------------
 # multi-tile kernels (TILE < N ≤ 80M)
 # ---------------------------------------------------------------------------
@@ -197,8 +211,10 @@ def _multi_tile_path(grad_output, mask, numel, N):
         )
 
     if n_selected < numel:
-        out = torch.zeros(numel, dtype=mask_selected.dtype, device=device)
-        out[:n_selected] = mask_selected
+        out = torch.empty(numel, dtype=mask_selected.dtype, device=device)
+        _pad_kernel[(triton.cdiv(numel, _TILE_SIZE),)](
+            mask_selected, out, n_selected, numel, BLOCK_SIZE=_TILE_SIZE,
+        )
         return out
     return mask_selected
 
