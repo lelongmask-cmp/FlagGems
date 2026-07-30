@@ -20,81 +20,84 @@ import triton.language as tl
 
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
-from flag_gems.utils.shape_utils import bracket_next_power_of_2
 
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Ascend masked_scatter_backward — hybrid dispatch.
+# Ascend masked_scatter_backward — normed_cumsum-style two-level prefix sum.
 #
-#   delegate  (N ≤ 67M):  delegate to Ascend masked_select (autotuned
-#                          scatter-write kernel) + zero-pad.  The internal
-#                          cumsum is grid-safe because ceil(N/1024) < 65536.
-#                          This is 50-200× faster than the triton path for
-#                          all sizes where cumsum works correctly.
+# Instead of relying on the recursive scan_then_fan_col cumsum (O(log N)
+# kernel launches, grid-limited), we compute the 1-based prefix sum over
+# the boolean mask ourselves using a fixed-launch two-level design:
 #
-#   triton    (N > 67M):  three-phase pure Triton.  The Ascend recursive
-#                          cumsum's grid exceeds 65536 and produces corrupt
-#                          results beyond this point.  The triton path is
-#                          slower (scattered writes + per-CTA cumsum) but
-#                          correct for arbitrary N.
+#   1. tile_cumsum:  split N into tiles, each CTA computes local cumsum
+#                    and stores the tile total.
+#   2. scan totals:  exclusive scan over tile totals (single-CTA or
+#                    two-level for > _MAX_SCAN_BLOCK tiles).
+#   3. tile_update:  add per-tile offsets to local cumsum values.
+#   4. scatter-write: autotuned masked_select_kernel with prefix sum.
+#   5. zero-pad:     pre-allocation + slice copy.
 #
-# At 655M elements the triton write kernel's absolute latency (~3.2 s)
-# is comparable to torch's aten implementation (~2.3 s), yielding a
-# speedup near 1.0×.  At 67M the aten kernel is very fast (~0.24 s)
-# while the triton write kernel is still ~0.2 s, so the gap is larger.
+# This gives a fixed 5-7 kernel launches for any N (vs. recursive cumsum
+# which adds 2 launches per recursion level).  No torch compute ops.
 # ---------------------------------------------------------------------------
 
-# ceil(67M / 1024) = 65536 = grid limit → cumsum breaks.
-# Keep a margin: ceil(60M / 1024) ≈ 58594 < 65535.
-_DELEGATE_MAX_N = 60 * 1024 * 1024  # 60M
-
-_MIN_BLOCK_SIZE = 128
-_MAX_BLOCK_SIZE = 4096
 _MAX_SCAN_BLOCK = 4096
+_TILE_SIZE = 4096
+# For N > 100M, use a larger tile to keep n_tiles manageable.
+_TILE_SIZE_HUGE = 16384
 
 
 # ---------------------------------------------------------------------------
-# delegate path (N ≤ 60M)
-# ---------------------------------------------------------------------------
-
-
-def _delegate_path(grad_output, mask, numel):
-    """Ascend masked_select + zero-pad (grid-safe for N ≤ 60M)."""
-    from .masked_select import masked_select
-
-    # int32 avoids cumsum bool→float32 precision loss
-    mask_selected = masked_select(grad_output, mask.to(torch.int32))
-
-    n_selected = mask_selected.numel()
-    if n_selected < numel:
-        out = torch.zeros(
-            numel, dtype=mask_selected.dtype, device=mask_selected.device
-        )
-        out[:n_selected] = mask_selected
-        return out
-    return mask_selected
-
-
-# ---------------------------------------------------------------------------
-# triton path kernels (N > 60M)
+# Triton kernels
 # ---------------------------------------------------------------------------
 
 
 @libentry()
 @triton.jit(do_not_specialize=["N"])
-def _count_kernel(
-    mask_ptr,
-    counts_ptr,
+def _tile_cumsum_kernel(
+    inp_ptr,
+    out_ptr,
+    tile_totals_ptr,
     N,
-    BLOCK_SIZE: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
 ):
+    """Per-tile inclusive cumsum + store tile total.
+
+    Each CTA processes one tile of up to TILE_SIZE elements.
+    For int32 input (mask values 0/1), the cumsum stays in exact int32
+    arithmetic (no float32 precision loss).
+    """
     pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask_vals = tl.load(mask_ptr + offsets, mask=offsets < N, other=0)
-    count = tl.sum(mask_vals.to(tl.int32), axis=0)
-    tl.store(counts_ptr + pid, count)
+    offsets = pid * TILE_SIZE + tl.arange(0, TILE_SIZE)
+    mask = offsets < N
+
+    x = tl.load(inp_ptr + offsets, mask=mask, other=0)
+    # int32 input → int32 cumsum (exact)
+    cumsum = tl.cumsum(x, axis=0)
+    tl.store(out_ptr + offsets, cumsum, mask=mask)
+
+    total = tl.sum(x, axis=0)
+    tl.store(tile_totals_ptr + pid, total)
+
+
+@libentry()
+@triton.jit(do_not_specialize=["N"])
+def _tile_update_kernel(
+    out_ptr,
+    tile_offsets_ptr,
+    N,
+    TILE_SIZE: tl.constexpr,
+):
+    """Add per-tile global offsets to each tile's local cumsum."""
+    pid = tl.program_id(0)
+    offsets = pid * TILE_SIZE + tl.arange(0, TILE_SIZE)
+    mask = offsets < N
+
+    val = tl.load(out_ptr + offsets, mask=mask, other=0)
+    offset = tl.load(tile_offsets_ptr + pid)
+    tl.store(out_ptr + offsets, val + offset, mask=mask)
 
 
 @libentry()
@@ -102,11 +105,12 @@ def _count_kernel(
 def _scan_kernel(
     counts_ptr,
     part_sums_ptr,
-    n_blocks,
+    n_elem,
     BLOCK_SIZE: tl.constexpr,
 ):
+    """Single-CTA exclusive scan."""
     offsets = tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_blocks
+    mask = offsets < n_elem
     counts = tl.load(counts_ptr + offsets, mask=mask, other=0)
     cumsums = tl.cumsum(counts, axis=0)
     tl.store(part_sums_ptr + offsets, cumsums - counts, mask=mask)
@@ -118,12 +122,13 @@ def _chunk_scan_kernel(
     counts_ptr,
     part_sums_ptr,
     chunk_totals_ptr,
-    n_blocks,
+    n_elem,
     CHUNK_SIZE: tl.constexpr,
 ):
+    """Multi-CTA chunked exclusive scan + store chunk totals."""
     pid = tl.program_id(0)
     offsets = pid * CHUNK_SIZE + tl.arange(0, CHUNK_SIZE)
-    mask = offsets < n_blocks
+    mask = offsets < n_elem
     counts = tl.load(counts_ptr + offsets, mask=mask, other=0)
     cumsums = tl.cumsum(counts, axis=0)
     tl.store(part_sums_ptr + offsets, cumsums - counts, mask=mask)
@@ -136,53 +141,38 @@ def _chunk_scan_kernel(
 def _add_offsets_kernel(
     part_sums_ptr,
     chunk_offsets_ptr,
-    n_blocks,
+    n_elem,
     CHUNK_SIZE: tl.constexpr,
 ):
+    """Add per-chunk offsets to local exclusive scan results."""
     pid = tl.program_id(0)
     offsets = pid * CHUNK_SIZE + tl.arange(0, CHUNK_SIZE)
-    mask = offsets < n_blocks
+    mask = offsets < n_elem
     val = tl.load(part_sums_ptr + offsets, mask=mask, other=0)
     chunk_offset = tl.load(chunk_offsets_ptr + pid)
     tl.store(part_sums_ptr + offsets, val + chunk_offset, mask=mask)
 
 
-@libentry()
-@triton.jit(do_not_specialize=["N"])
-def _write_kernel(
-    grad_ptr,
-    mask_ptr,
-    part_sums_ptr,
-    out_ptr,
-    N,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    block_mask = offsets < N
-
-    mask_val = tl.load(mask_ptr + offsets, mask=block_mask, other=0).to(tl.int1)
-    grad_val = tl.load(grad_ptr + offsets, mask=block_mask, other=0)
-
-    global_offset = tl.load(part_sums_ptr + pid)
-    local_pos = tl.cumsum(mask_val.to(tl.int32), axis=0) - 1
-    pos = global_offset + local_pos
-
-    tl.store(out_ptr + pos, grad_val, mask=(block_mask & mask_val))
+# ---------------------------------------------------------------------------
+# Host helpers
+# ---------------------------------------------------------------------------
 
 
-def _exclusive_scan(block_counts, n_blocks, device):
-    part_sums = torch.empty(n_blocks, dtype=torch.int64, device=device)
-    if n_blocks <= _MAX_SCAN_BLOCK:
-        scan_block_size = triton.next_power_of_2(n_blocks)
-        _scan_kernel[(1,)](
-            block_counts, part_sums, n_blocks, BLOCK_SIZE=scan_block_size
-        )
+def _exclusive_scan(arr, n_elems, device):
+    """Exclusive scan over an array, on-device.
+
+    Single-CTA for n_elems ≤ _MAX_SCAN_BLOCK, two-level otherwise.
+    """
+    part_sums = torch.empty(n_elems, dtype=torch.int64, device=device)
+
+    if n_elems <= _MAX_SCAN_BLOCK:
+        scan_block = triton.next_power_of_2(n_elems)
+        _scan_kernel[(1,)](arr, part_sums, n_elems, BLOCK_SIZE=scan_block)
     else:
-        n_chunks = triton.cdiv(n_blocks, _MAX_SCAN_BLOCK)
+        n_chunks = triton.cdiv(n_elems, _MAX_SCAN_BLOCK)
         chunk_totals = torch.empty(n_chunks, dtype=torch.int64, device=device)
         _chunk_scan_kernel[(n_chunks,)](
-            block_counts, part_sums, chunk_totals, n_blocks,
+            arr, part_sums, chunk_totals, n_elems,
             CHUNK_SIZE=_MAX_SCAN_BLOCK,
         )
         chunk_offsets = torch.empty(n_chunks, dtype=torch.int64, device=device)
@@ -191,36 +181,56 @@ def _exclusive_scan(block_counts, n_blocks, device):
             chunk_totals, chunk_offsets, n_chunks, BLOCK_SIZE=scan_block2,
         )
         _add_offsets_kernel[(n_chunks,)](
-            part_sums, chunk_offsets, n_blocks, CHUNK_SIZE=_MAX_SCAN_BLOCK,
+            part_sums, chunk_offsets, n_elems, CHUNK_SIZE=_MAX_SCAN_BLOCK,
         )
     return part_sums
 
 
-def _triton_path(grad_output, mask, numel, N):
-    """Three-phase Triton for N > 60M (cumsum grid-unsafe territory)."""
-    BLOCK_SIZE = bracket_next_power_of_2(N, _MIN_BLOCK_SIZE, _MAX_BLOCK_SIZE)
-    n_blocks = triton.cdiv(N, BLOCK_SIZE)
-    out = torch.zeros(numel, dtype=grad_output.dtype, device=grad_output.device)
-    with torch_device_fn.device(grad_output.device):
-        counts = torch.empty(n_blocks, dtype=torch.int64, device=mask.device)
-        _count_kernel[(n_blocks,)](
-            mask.ravel(), counts, N, BLOCK_SIZE=BLOCK_SIZE,
-        )
-        part_sums = _exclusive_scan(counts, n_blocks, mask.device)
-        _write_kernel[(n_blocks,)](
-            grad_output.ravel(), mask.ravel(), part_sums, out, N,
-            BLOCK_SIZE=BLOCK_SIZE,
-        )
-    return out
+def _two_level_prefix_sum(mask_flat, N, device):
+    """Compute 1-based inclusive prefix sum of a 1-D int32 mask.
+
+    Uses the normed_cumsum two-level pattern:
+      1. tile_cumsum   — local cumsum per tile + store tile total
+      2. exclusive scan — over tile totals (single-CTA or two-level)
+      3. tile_update   — add per-tile global offsets
+
+    Returns a 1-D int32 tensor of shape (N,) with the prefix sum.
+    Always 3-5 kernel launches regardless of N.
+    """
+    tile_size = _TILE_SIZE_HUGE if N > 100_000_000 else _TILE_SIZE
+    n_tiles = triton.cdiv(N, tile_size)
+
+    # 1. per-tile cumsum
+    prefix_sum = torch.empty(N, dtype=torch.int32, device=device)
+    tile_totals = torch.empty(n_tiles, dtype=torch.int64, device=device)
+    _tile_cumsum_kernel[(n_tiles,)](
+        mask_flat, prefix_sum, tile_totals, N,
+        TILE_SIZE=tile_size,
+    )
+
+    # 2. exclusive scan of tile totals → per-tile offsets
+    tile_offsets = _exclusive_scan(tile_totals, n_tiles, device)
+
+    # 3. add tile offsets to local cumsum values
+    _tile_update_kernel[(n_tiles,)](
+        prefix_sum, tile_offsets, N, TILE_SIZE=tile_size,
+    )
+
+    return prefix_sum
 
 
 # ---------------------------------------------------------------------------
-# Public entry point
+# Main implementation
 # ---------------------------------------------------------------------------
 
 
 def masked_scatter_backward(grad_output, mask, sizes):
-    """Backward of masked_scatter w.r.t. ``source``."""
+    """Backward of masked_scatter w.r.t. ``source``.
+
+    Uses a normed_cumsum-style two-level prefix sum (fixed O(1) kernel
+    launches) + the autotuned Ascend masked_select scatter-write kernel.
+    No recursive cumsum, no grid-limit ceiling.
+    """
     logger.debug("GEMS_ASCEND MASKED_SCATTER_BACKWARD")
 
     sizes = list(sizes)
@@ -229,10 +239,37 @@ def masked_scatter_backward(grad_output, mask, sizes):
         numel *= int(s)
 
     N = mask.numel()
+    device = grad_output.device
 
-    if N <= _DELEGATE_MAX_N:
-        out = _delegate_path(grad_output, mask, numel)
-    else:
-        out = _triton_path(grad_output, mask, numel, N)
+    with torch_device_fn.device(device):
+        # 1. two-level prefix sum (int32 for exact arithmetic)
+        mask_flat = mask.ravel().to(torch.int32)
+        prefix_sum = _two_level_prefix_sum(mask_flat, N, device)
 
-    return out.view(sizes)
+        # 2. allocate compacted output
+        n_selected = prefix_sum[-1].item()
+        mask_selected = torch.empty(
+            n_selected, dtype=grad_output.dtype, device=device
+        )
+
+        # 3. autotuned scatter-write (same kernel as Ascend masked_select)
+        from .masked_select import masked_select_kernel
+
+        grid = lambda meta: (triton.cdiv(N, meta["BLOCK_SIZE"]),)
+        masked_select_kernel[grid](
+            grad_output.ravel(),
+            mask_flat,
+            prefix_sum,
+            mask_selected,
+            N,
+        )
+
+        # 4. zero-pad to target size
+        if n_selected < numel:
+            out = torch.zeros(
+                numel, dtype=mask_selected.dtype, device=device
+            )
+            out[:n_selected] = mask_selected
+            mask_selected = out
+
+    return mask_selected.view(sizes)
