@@ -15,7 +15,6 @@
 import logging
 
 import torch
-import torch_npu  # noqa: F401  (native kernels for the .out dispatch below)
 import triton
 import triton.language as tl
 
@@ -41,29 +40,79 @@ logger = logging.getLogger(__name__)
 #                            last program zero-fills the disjoint tail
 #                            [total, numel).
 #
-#   large N   (#blocks > 128): torch.nonzero(mask) (native, ~1.6ms @16M)
-#                            gives idx, then ONE Triton kernel iterates the
-#                            COMPACT output range:
-#                              dense load idx -> gather load grad[idx]
-#                              -> affine store out[j], plus affine zero-fill
-#                              of [k, numel).
-#                            A scattered GATHER load measures ~40ns/lane on
-#                            910B — ~5x cheaper than the scattered STORE
-#                            (~200ns/lane) the old count->scan->scatter
-#                            formulation used (24ms @16M; the flip is ~5ms).
-#                            idx is only read and out is written only by
-#                            this kernel, so no stream sync is needed.
+#   large N   (#blocks > 128): count(+dense zero-fill of the whole output)
+#                            -> stream sync -> device-side exclusive scan
+#                            -> stream sync -> scatter.
+#
+#   Why not the faster gather-based formulation
+#     (out[j] = grad[idx[j]] with affine stores)?  That needs idx, the
+#     sorted True positions — a stream compaction.  On triton-ascend 3.2.0
+#     every expressible compaction costs the scattered-store wall:
+#       - FlagGems' own nonzero/masked_select: cumsum + per-lane scatter
+#         (~24-32ms @16M — same wall, and host torch compute ops are
+#         forbidden in FlagGems ops anyway)
+#       - torch.nonzero / aten::nonzero.out: native C++ ~1.7ms, but native
+#         torch compute ops are forbidden by the FlagGems op requirements
+#       - hand-written bitonic: ~550µs per 1024-block -> 225ms @16M
+#       - per-lane binary search over rank: needs a vector->scalar lane
+#         extract, which Triton lacks (only reductions)
+#       - tl.sort: compile failure ([ConvertLinalgRToBinary] pass)
+#     With idx costing >= 24ms, the gather formulation (idx + ~5ms gather
+#     kernel) cannot beat the plain scatter path below — hence this layout.
 #
 # Measured platform costs (910B4, triton-ascend 3.2.0):
-#   kernel launch ~57µs device time, stream sync ~7µs,
-#   scattered store ~200ns/lane, scattered gather load ~40ns/lane,
-#   dense stores are HBM-bandwidth fast.
+#   kernel launch ~57µs device time, stream sync ~7µs, device-wide sync ~80µs,
+#   scattered store ~200ns/lane (dense stores are HBM-bandwidth fast;
+#   scattered GATHER loads would be ~40ns/lane but need idx above).
+#   These fixed costs dominate everything below ~1M elements, so the number
+#   of launches/syncs is the primary knob for small/medium shapes.
 # ---------------------------------------------------------------------------
 
 _MIN_BLOCK_SIZE = 128
 _MAX_BLOCK_SIZE = 1024
+_MAX_SCAN_BLOCK = 4096
 _MAX_REREAD_BLOCKS = 128
 _REREAD_CHUNK = 4096  # (must be restated literally inside jit kernels)
+
+
+def _stream_sync():
+    """Wait for all prior work on the current stream (~7µs on 910B)."""
+    torch.npu.current_stream().synchronize()
+
+
+@libentry()
+@triton.jit(do_not_specialize=["N", "numel"])
+def _count_zerofill_kernel(
+    mask_ptr, counts_ptr, out_ptr, N, numel, BLOCK_SIZE: tl.constexpr,
+):
+    """Per-CTA True count + dense zero-fill of the whole output buffer.
+
+    The zero-fill is done here (first kernel) rather than in a separate
+    launch, and densely — the scatter kernel later overwrites the selected
+    prefix, so it never reads the zeros (no read-visibility dependency).
+    """
+    pid = ext.program_id(axis=0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    m = offsets < N
+    mask_val = tl.load(mask_ptr + offsets, mask=m, other=0).to(tl.int32)
+    tl.store(counts_ptr + pid, tl.sum(mask_val, axis=0))
+    # Dense zero-fill of out[0:numel) — covered by grid = cdiv(max(N, numel), BLOCK)
+    tl.store(out_ptr + offsets, 0.0, mask=(offsets < numel))
+
+
+@libentry()
+@triton.jit(do_not_specialize=["N", "numel"])
+def _scatter_kernel(
+    grad_ptr, mask_ptr, offsets_ptr, out_ptr, N, numel, BLOCK_SIZE: tl.constexpr,
+):
+    """Scatter True elements to their compact positions (offsets precomputed)."""
+    pid = ext.program_id(axis=0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    m = offsets < N
+    mask_val = tl.load(mask_ptr + offsets, mask=m, other=0).to(tl.int32)
+    grad_val = tl.load(grad_ptr + offsets, mask=m, other=0)
+    pos = tl.load(offsets_ptr + pid) + tl.cumsum(mask_val, axis=0) - 1
+    tl.store(out_ptr + pos, grad_val, mask=m & (mask_val == 1) & (pos < numel))
 
 
 @libentry()
@@ -117,25 +166,69 @@ def _scatter_reread_kernel(
             tl.store(out_ptr + zoffs, 0.0, mask=(zoffs < numel) & (zoffs >= total))
 
 
-@libentry()
-@triton.jit(do_not_specialize=["k", "numel"])
-def _flip_kernel(
-    grad_ptr, idx_ptr, out_ptr, k, numel, BLOCK_SIZE: tl.constexpr,
-):
-    """One kernel over the compact output range.
+# ---------------------------------------------------------------------------
+# device-side exclusive scan over block counts
+# ---------------------------------------------------------------------------
 
-    out[j] = grad[idx[j]] for j < k (dense load of idx, scattered GATHER of
-    grad, affine store); out[j] = 0 for k <= j < numel.  The two stores have
-    disjoint masks, so every output element is written exactly once by one
-    lane — no sync, no separate zero-fill launch.
-    """
+
+@libentry()
+@triton.jit
+def _scan_kernel(counts_ptr, part_sums_ptr, n_elem, BLOCK_SIZE: tl.constexpr):
+    offsets = tl.arange(0, BLOCK_SIZE)
+    m = offsets < n_elem
+    counts = tl.load(counts_ptr + offsets, mask=m, other=0)
+    cumsums = tl.cumsum(counts, axis=0)
+    tl.store(part_sums_ptr + offsets, cumsums - counts, mask=m)
+
+
+@libentry()
+@triton.jit
+def _chunk_scan_kernel(
+    counts_ptr, part_sums_ptr, chunk_totals_ptr, n_elem, CHUNK_SIZE: tl.constexpr,
+):
     pid = ext.program_id(axis=0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    m = offsets < k
-    pos = tl.load(idx_ptr + offsets, mask=m, other=0)
-    val = tl.load(grad_ptr + pos, mask=m, other=0)
-    tl.store(out_ptr + offsets, val, mask=m)
-    tl.store(out_ptr + offsets, 0.0, mask=(offsets >= k) & (offsets < numel))
+    offsets = pid * CHUNK_SIZE + tl.arange(0, CHUNK_SIZE)
+    m = offsets < n_elem
+    counts = tl.load(counts_ptr + offsets, mask=m, other=0)
+    cumsums = tl.cumsum(counts, axis=0)
+    tl.store(part_sums_ptr + offsets, cumsums - counts, mask=m)
+    tl.store(chunk_totals_ptr + pid, tl.sum(counts, axis=0))
+
+
+@libentry()
+@triton.jit
+def _add_offsets_kernel(
+    part_sums_ptr, chunk_offsets_ptr, n_elem, CHUNK_SIZE: tl.constexpr,
+):
+    pid = ext.program_id(axis=0)
+    offsets = pid * CHUNK_SIZE + tl.arange(0, CHUNK_SIZE)
+    m = offsets < n_elem
+    val = tl.load(part_sums_ptr + offsets, mask=m, other=0)
+    tl.store(part_sums_ptr + offsets, val + tl.load(chunk_offsets_ptr + pid), mask=m)
+
+
+def _exclusive_scan(arr, n_elems, device):
+    part_sums = torch.empty(n_elems, dtype=torch.int64, device=device)
+    if n_elems <= _MAX_SCAN_BLOCK:
+        scan_block = triton.next_power_of_2(n_elems)
+        _scan_kernel[(1,)](arr, part_sums, n_elems, BLOCK_SIZE=scan_block)
+    else:
+        n_chunks = triton.cdiv(n_elems, _MAX_SCAN_BLOCK)
+        chunk_totals = torch.empty(n_chunks, dtype=torch.int64, device=device)
+        _chunk_scan_kernel[(n_chunks,)](
+            arr, part_sums, chunk_totals, n_elems, CHUNK_SIZE=_MAX_SCAN_BLOCK,
+        )
+        _stream_sync()
+        chunk_offsets = torch.empty(n_chunks, dtype=torch.int64, device=device)
+        scan_block2 = triton.next_power_of_2(n_chunks)
+        _scan_kernel[(1,)](
+            chunk_totals, chunk_offsets, n_chunks, BLOCK_SIZE=scan_block2,
+        )
+        _stream_sync()
+        _add_offsets_kernel[(n_chunks,)](
+            part_sums, chunk_offsets, n_elems, CHUNK_SIZE=_MAX_SCAN_BLOCK,
+        )
+    return part_sums
 
 
 # ---------------------------------------------------------------------------
@@ -170,18 +263,20 @@ def masked_scatter_backward(grad_output, mask, sizes):
                 BLOCK_SIZE=BLOCK_SIZE,
             )
         else:
-            # Native nonzero for the sorted True positions, then one Triton
-            # kernel over the compact range (gather load + affine stores).
-            idx = torch.nonzero(mask.ravel()).view(-1)
-            k = idx.numel()
-            if k == 0:
-                # Empty nonzero result has no storage — hand the kernel a
-                # valid pointer; every gather lane is masked off (j < 0), so
-                # it is never read.  The kernel then zero-fills all of out.
-                idx = torch.zeros(1, dtype=torch.int64, device=device)
-            grid = triton.cdiv(numel, BLOCK_SIZE)
-            _flip_kernel[(grid,)](
-                grad_output.ravel(), idx, out, k, numel,
+            # count(+zero-fill) -> stream sync -> device scan -> stream sync
+            # -> scatter.  All Triton — no torch compute ops.
+            counts = torch.empty(n_blocks, dtype=torch.int64, device=device)
+            # Grid covers the larger of N (counting) and numel (zero-fill) so
+            # the whole output is zeroed densely even when numel > N.
+            grid_c = triton.cdiv(max(N, numel), BLOCK_SIZE)
+            _count_zerofill_kernel[(grid_c,)](
+                mask.ravel(), counts, out, N, numel, BLOCK_SIZE=BLOCK_SIZE,
+            )
+            _stream_sync()
+            offsets = _exclusive_scan(counts, n_blocks, device)
+            _stream_sync()
+            _scatter_kernel[(n_blocks,)](
+                grad_output.ravel(), mask.ravel(), offsets, out, N, numel,
                 BLOCK_SIZE=BLOCK_SIZE,
             )
 
